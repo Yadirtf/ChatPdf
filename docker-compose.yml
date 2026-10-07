@@ -1,0 +1,60 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: chatpdf
+      POSTGRES_PASSWORD: chatpdf
+      POSTGRES_DB: chatpdf
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatpdf"]
+      interval: 3s
+      retries: 20
+
+  # Modelo abierto local y gratuito. Si ya tienes Ollama instalado en tu máquina,
+  # puedes quitar este servicio y usar OLLAMA_BASE_URL=http://host.docker.internal:11434
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    # Con GPU NVIDIA, descomenta:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+
+  # Descarga una sola vez los modelos de chat y embeddings.
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on: [ollama]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "sleep 3 && ollama pull ${OLLAMA_CHAT_MODEL:-llama3.2:3b} && ollama pull ${OLLAMA_EMBED_MODEL:-nomic-embed-text}"
+    restart: "no"
+
+  app:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://chatpdf:chatpdf@db:5432/chatpdf
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  ollama:
