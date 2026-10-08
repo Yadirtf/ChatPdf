@@ -115,7 +115,7 @@ export default function Settings({ open, onClose, onSaved }: Props) {
         <section className={cfg.llm_provider === "ollama" || cfg.embed_provider === "ollama" ? "" : "dim"}>
           <span className="kicker mono">Ollama</span>
           {field("ollama", "base_url", "URL")}
-          {field("ollama", "chat_model", "Modelo de chat", { list: true, ph: "llama3.2:3b" })}
+          {field("ollama", "chat_model", "Modelo de chat", { list: true, ph: "gemma4:e2b" })}
           {field("ollama", "embed_model", "Modelo de embeddings", { list: true, ph: "nomic-embed-text" })}
           <button className="ghost mono" onClick={() => loadModels("ollama")}>probar conexión →</button>
           {probe.ollama && <p className="hint mono">{probe.ollama}</p>}

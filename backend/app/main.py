@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db, providers, rag
-from .config import settings
+from .config import BACKEND, settings
 from .pdf import PdfError
 
 log = logging.getLogger("chatpdf")
@@ -48,8 +48,19 @@ def health():
     cfg = providers.load()
     status = {"db": True, "limits": {"max_pages": settings.max_pages, "max_file_mb": settings.max_file_mb}}
     try:
-        models = providers.list_models(cfg["llm_provider"], cfg)
-        status["llm"] = {"ok": True, "provider": cfg["llm_provider"], "models": len(models)}
+        provider = cfg["llm_provider"]
+        models = providers.list_models(provider, cfg)
+        status["llm"] = {"ok": True, "provider": provider, "models": len(models)}
+        if provider == "ollama":
+            # Ollama nombra "modelo:latest" cuando no se indica etiqueta.
+            have = set(models) | {m.removesuffix(":latest") for m in models}
+            wanted = {cfg["ollama"]["chat_model"]}
+            if cfg["embed_provider"] == "ollama":
+                wanted.add(cfg["ollama"]["embed_model"])
+            missing = sorted(m for m in wanted if m not in have)
+            if missing:
+                status["llm"] = {"ok": False, "provider": provider,
+                                 "error": "Falta descargar: " + ", ".join(f"ollama pull {m}" for m in missing)}
     except providers.ProviderError as e:
         status["llm"] = {"ok": False, "provider": cfg["llm_provider"], "error": str(e)}
     return status
@@ -142,8 +153,13 @@ def chat(doc_id: UUID, body: Ask):
 
 # ---------- Frontend compilado ----------
 
-static = Path(settings.static_dir)
-if static.is_dir():
+def _static_dir() -> Path | None:
+    candidates = [Path(settings.static_dir)] if settings.static_dir else [BACKEND / "static", BACKEND.parent / "frontend" / "dist"]
+    return next((p for p in candidates if (p / "index.html").is_file()), None)
+
+
+static = _static_dir()
+if static:
     app.mount("/assets", StaticFiles(directory=static / "assets"), name="assets")
 
     @app.get("/{path:path}", include_in_schema=False)
