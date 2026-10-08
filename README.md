@@ -6,14 +6,23 @@ La interfaz muestra un **mapa semántico** en vivo: cada fragmento del PDF es un
 
 ## Arranque rápido (Docker)
 
+Con Ollama instalado en tu PC (con `gemma4:e2b` y `nomic-embed-text` descargados):
+
 ```bash
 cp .env.example .env        # opcional
 docker compose up -d --build
 ```
 
-- La app queda en **http://localhost:8000**.
-- La primera vez, `ollama-pull` descarga `gemma4:e2b` y `nomic-embed-text`. Sigue el progreso con `docker compose logs -f ollama-pull`.
-- ¿Ya tienes Ollama instalado en tu máquina? Pon `OLLAMA_BASE_URL=http://host.docker.internal:11434` en `.env` y levanta solo `docker compose up -d db app`.
+- La app queda en **http://localhost:8000**. PostgreSQL + pgvector corre en Docker, publicado en el puerto **5433** para no chocar con un PostgreSQL local.
+- La app llega al Ollama de tu PC por `http://host.docker.internal:11434`. Dentro de un contenedor, `localhost` es el propio contenedor, así que **no uses `localhost` en el botón motor cuando corras con Docker**.
+- **Linux:** Ollama escucha solo en `127.0.0.1` por defecto y Docker no lo alcanza. Configúralo con `OLLAMA_HOST=0.0.0.0` (`sudo systemctl edit ollama` → `Environment="OLLAMA_HOST=0.0.0.0"`) y reinícialo. En Windows y macOS (Docker Desktop) no hace falta.
+
+¿Sin Ollama en tu PC? Usa el de Docker, que además descarga los modelos solo:
+
+```bash
+DOCKER_OLLAMA_URL=http://ollama:11434 docker compose --profile ollama up -d --build
+docker compose logs -f ollama-pull      # progreso de la descarga
+```
 
 ## Ejecutar sin Docker
 
