@@ -488,7 +488,7 @@ export default function App() {
 
       {health && !health.llm.ok && (
         <button className="banner mono" onClick={() => setSettingsOpen(true)}>
-          ⚠ El motor no responde ({health.llm.provider}). Revisa que Ollama esté activo o configura una API key →
+          ⚠ {health.llm.error?.startsWith("Falta") ? health.llm.error : `El motor no responde (${health.llm.provider}). Revisa que Ollama esté activo o configura una API key`} →
         </button>
       )}
 

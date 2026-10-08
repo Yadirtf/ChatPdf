@@ -1,10 +1,17 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BACKEND = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
     """Valores por defecto leídos del entorno. La UI puede sobrescribir los del proveedor."""
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # Lee .env desde la raíz del proyecto o desde backend/ (el último gana).
+    model_config = SettingsConfigDict(
+        env_file=(BACKEND.parent / ".env", BACKEND / ".env"), env_file_encoding="utf-8", extra="ignore"
+    )
 
     database_url: str = "postgresql://chatpdf:chatpdf@localhost:5432/chatpdf"
 
@@ -19,7 +26,7 @@ class Settings(BaseSettings):
     embed_provider: str = "ollama"
 
     ollama_base_url: str = "http://localhost:11434"
-    ollama_chat_model: str = "llama3.2:3b"
+    ollama_chat_model: str = "gemma4:e2b"
     ollama_embed_model: str = "nomic-embed-text"
 
     # Cualquier API compatible con OpenAI (OpenAI, Groq, OpenRouter, Together, LM Studio...)
@@ -28,7 +35,8 @@ class Settings(BaseSettings):
     openai_chat_model: str = "gpt-4o-mini"
     openai_embed_model: str = "text-embedding-3-small"
 
-    static_dir: str = "static"
+    # Interfaz compilada. Vacío = usa backend/static (Docker) o frontend/dist (local).
+    static_dir: str = ""
 
 
 settings = Settings()

@@ -12,28 +12,25 @@ docker compose up -d --build
 ```
 
 - La app queda en **http://localhost:8000**.
-- La primera vez, `ollama-pull` descarga `llama3.2:3b` y `nomic-embed-text` (unos 2.3 GB). Sigue el progreso con `docker compose logs -f ollama-pull`.
+- La primera vez, `ollama-pull` descarga `gemma4:e2b` y `nomic-embed-text`. Sigue el progreso con `docker compose logs -f ollama-pull`.
 - ¿Ya tienes Ollama instalado en tu máquina? Pon `OLLAMA_BASE_URL=http://host.docker.internal:11434` en `.env` y levanta solo `docker compose up -d db app`.
 
-## Desarrollo sin Docker
+## Ejecutar sin Docker
+
+Guía paso a paso (Windows, macOS y Linux), incluida la instalación de pgvector: **[docs/instalacion-local.md](docs/instalacion-local.md)**.
+
+Resumen, con PostgreSQL + pgvector y Ollama ya instalados:
 
 ```bash
-# 1. Base de datos con pgvector
-docker compose up -d db
+ollama pull gemma4:e2b && ollama pull nomic-embed-text
+cp .env.example .env
 
-# 2. Ollama local
-ollama pull llama3.2:3b && ollama pull nomic-embed-text
-
-# 3. API (Python 3.11+)
-cd backend
-python -m venv .venv && source .venv/bin/activate
+cd backend && python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload          # http://localhost:8000
+uvicorn app.main:app --reload           # API en http://localhost:8000
 
-# 4. Interfaz (Node 20+)
-cd frontend
-npm install
-npm run dev                             # http://localhost:5173 (proxy a /api)
+cd ../frontend && npm install && npm run build   # la API sirve la interfaz en :8000
+# o, para editar la interfaz con recarga en vivo: npm run dev → http://localhost:5173
 ```
 
 ## Usar una API key en lugar del modelo local

@@ -64,8 +64,22 @@ def init_db():
     # La extensión debe existir antes de registrar el tipo vector en el pool.
     import psycopg
 
-    with psycopg.connect(settings.database_url, autocommit=True) as conn:
-        conn.execute(SCHEMA)
+    try:
+        with psycopg.connect(settings.database_url, autocommit=True) as conn:
+            conn.execute(SCHEMA)
+    except (psycopg.errors.FeatureNotSupported, psycopg.errors.UndefinedFile,
+            psycopg.errors.InsufficientPrivilege) as e:
+        raise SystemExit(
+            "\n✗ La extensión pgvector no está instalada o el usuario no puede activarla.\n"
+            "  Instálala y ejecuta como superusuario (postgres) en la base chatpdf:\n"
+            "      CREATE EXTENSION vector;\n"
+            f"  Detalle: {e}\n"
+        ) from e
+    except psycopg.OperationalError as e:
+        raise SystemExit(
+            f"\n✗ No se pudo conectar a PostgreSQL ({settings.database_url}).\n"
+            f"  ¿Está corriendo el servicio y existe la base de datos? Detalle: {e}\n"
+        ) from e
     pool = ConnectionPool(
         settings.database_url,
         min_size=1,
