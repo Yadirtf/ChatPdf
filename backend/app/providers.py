@@ -7,6 +7,8 @@
 
 import json
 from collections.abc import Iterator
+from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from psycopg.types.json import Jsonb
@@ -84,6 +86,19 @@ def public(cfg: dict) -> dict:
     return out
 
 
+IN_DOCKER = Path("/.dockerenv").exists()
+
+
+def _unreachable(provider: str, base_url: str, err: Exception) -> ProviderError:
+    msg = f"No se pudo conectar con {provider} ({base_url}): {err}"
+    host = urlparse(base_url).hostname or ""
+    if IN_DOCKER and host in ("localhost", "127.0.0.1", "::1"):
+        # Dentro del contenedor, localhost es el propio contenedor, no tu PC.
+        msg += (". La app corre en Docker: usa http://host.docker.internal:"
+                f"{urlparse(base_url).port or 11434} en el botón motor para llegar al Ollama de tu PC.")
+    return ProviderError(msg)
+
+
 def _openai_headers(p: dict) -> dict:
     h = {"Content-Type": "application/json"}
     if p.get("api_key"):
@@ -128,7 +143,7 @@ def embed(texts: list[str], provider: str, model: str, cfg: dict | None = None) 
         data = sorted(r.json()["data"], key=lambda d: d["index"])
         return [d["embedding"] for d in data]
     except httpx.HTTPError as e:
-        raise ProviderError(f"No se pudo conectar con {provider} ({p['base_url']}): {e}") from e
+        raise _unreachable(provider, p["base_url"], e) from e
 
 
 # ---------- Chat (streaming) ----------
@@ -185,7 +200,7 @@ def chat_stream(messages: list[dict], cfg: dict | None = None) -> Iterator[str]:
                     if piece:
                         yield piece
     except httpx.HTTPError as e:
-        raise ProviderError(f"No se pudo conectar con {provider} ({p['base_url']}): {e}") from e
+        raise _unreachable(provider, p["base_url"], e) from e
 
 
 # ---------- Utilidades ----------
@@ -202,4 +217,4 @@ def list_models(provider: str, cfg: dict | None = None) -> list[str]:
         _raise(r, "API")
         return sorted(m["id"] for m in r.json().get("data", []))
     except httpx.HTTPError as e:
-        raise ProviderError(f"No se pudo conectar con {provider}: {e}") from e
+        raise _unreachable(provider, p["base_url"], e) from e

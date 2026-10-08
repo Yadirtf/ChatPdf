@@ -150,4 +150,8 @@ Abre **<http://localhost:8000>**: la API sirve la interfaz compilada.
 
 ## Volver a Docker más adelante
 
-No hay que cambiar nada: `docker compose up -d --build` usa sus propios PostgreSQL (con pgvector) y Ollama, y descarga `gemma4:e2b` y `nomic-embed-text`. Si quieres que use el Ollama que ya tienes instalado, pon `OLLAMA_BASE_URL=http://host.docker.internal:11434` en `.env` y levanta solo `docker compose up -d db app`. Si tu PostgreSQL local ya ocupa el puerto 5432, detenlo antes o cambia el puerto publicado en `docker-compose.yml`.
+`docker compose up -d --build` levanta PostgreSQL + pgvector en Docker (en el puerto 5433, así no choca con tu PostgreSQL local) y la app, que usa el **Ollama de tu PC** a través de `http://host.docker.internal:11434`. No hay que tocar `.env`: Docker reemplaza `DATABASE_URL` y `OLLAMA_BASE_URL` con sus propios valores.
+
+- Si en el botón **motor** guardaste `http://localhost:11434`, cámbialo a `http://host.docker.internal:11434` mientras uses Docker. Dentro de un contenedor, `localhost` es el propio contenedor y no tu PC.
+- En Linux, haz que Ollama escuche en todas las interfaces (`OLLAMA_HOST=0.0.0.0`) para que Docker pueda alcanzarlo.
+- La base de datos de Docker es distinta de la local, así que los PDFs indexados en un modo no aparecen en el otro.
