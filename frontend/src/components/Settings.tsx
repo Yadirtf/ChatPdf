@@ -117,6 +117,17 @@ export default function Settings({ open, onClose, onSaved }: Props) {
           {field("ollama", "base_url", "URL")}
           {field("ollama", "chat_model", "Modelo de chat", { list: true, ph: "gemma4:e2b" })}
           {field("ollama", "embed_model", "Modelo de embeddings", { list: true, ph: "nomic-embed-text" })}
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={String(cfg.ollama.think).toLowerCase() === "true"}
+              onChange={(e) => set("ollama", "think", e.target.checked ? "true" : "false")}
+            />
+            <span>
+              <b>Razonamiento previo</b>
+              <small>Modelos como gemma4 piensan antes de responder. Da respuestas más elaboradas, pero en CPU puede tardar minutos.</small>
+            </span>
+          </label>
           <button className="ghost mono" onClick={() => loadModels("ollama")}>probar conexión →</button>
           {probe.ollama && <p className="hint mono">{probe.ollama}</p>}
         </section>

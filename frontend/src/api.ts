@@ -19,13 +19,14 @@ export type Message = {
   content: string;
   sources?: { query: { x: number; y: number }; items: Source[] } | null;
   pending?: boolean;
+  status?: string;
   error?: string;
 };
 
 export type ProviderCfg = {
   llm_provider: "ollama" | "openai";
   embed_provider: "ollama" | "openai";
-  ollama: { base_url: string; chat_model: string; embed_model: string };
+  ollama: { base_url: string; chat_model: string; embed_model: string; think?: string };
   openai: { base_url: string; api_key: string; chat_model: string; embed_model: string; has_key?: boolean };
 };
 

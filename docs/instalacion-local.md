@@ -1,5 +1,7 @@
 # Ejecutar ChatPdf sin Docker
 
+> ¿Prefieres no instalar PostgreSQL? La forma más simple es tener solo la base de datos en Docker (`docker compose up -d`) y la app y Ollama en tu PC: ver el [README](../README.md#arranque-rápido-base-de-datos-en-docker-app-y-ollama-en-tu-pc). Esta guía es para instalar también PostgreSQL y pgvector en tu PC.
+
 Esta guía levanta todo en tu máquina: PostgreSQL con pgvector, Ollama, la API en Python y la interfaz. Docker sigue funcionando igual (`docker compose up -d --build`) para cuando lo necesites.
 
 Necesitas:
@@ -92,7 +94,7 @@ En la raíz del proyecto:
 cp .env.example .env          # Windows: copy .env.example .env
 ```
 
-Los valores por defecto ya apuntan a tu instalación local (`localhost:5432`, usuario y contraseña `chatpdf`, `gemma4:e2b` y `nomic-embed-text`). Si usaste otra contraseña o puerto, edita `DATABASE_URL`.
+Cambia el puerto de `DATABASE_URL` a **5432** (el `.env.example` trae 5433, el de la base en Docker). El resto ya apunta a tu instalación local (usuario y contraseña `chatpdf`, `gemma4:e2b` y `nomic-embed-text`). Si usaste otra contraseña o puerto, edita `DATABASE_URL`.
 
 ---
 
@@ -150,8 +152,6 @@ Abre **<http://localhost:8000>**: la API sirve la interfaz compilada.
 
 ## Volver a Docker más adelante
 
-`docker compose up -d --build` levanta PostgreSQL + pgvector en Docker (en el puerto 5433, así no choca con tu PostgreSQL local) y la app, que usa el **Ollama de tu PC** a través de `http://host.docker.internal:11434`. No hay que tocar `.env`: Docker reemplaza `DATABASE_URL` y `OLLAMA_BASE_URL` con sus propios valores.
-
-- Si en el botón **motor** guardaste `http://localhost:11434`, cámbialo a `http://host.docker.internal:11434` mientras uses Docker. Dentro de un contenedor, `localhost` es el propio contenedor y no tu PC.
-- En Linux, haz que Ollama escuche en todas las interfaces (`OLLAMA_HOST=0.0.0.0`) para que Docker pueda alcanzarlo.
-- La base de datos de Docker es distinta de la local, así que los PDFs indexados en un modo no aparecen en el otro.
+- **Solo la base de datos en Docker:** `docker compose up -d` y usa el puerto `5433` en `DATABASE_URL`.
+- **También la app en Docker:** `docker compose --profile app up -d --build`. La app usa el Ollama de tu PC vía `http://host.docker.internal:11434`. Si en el botón **motor** guardaste `http://localhost:11434`, cámbialo mientras uses la app en Docker. En Linux, Ollama debe escuchar en `0.0.0.0` (`OLLAMA_HOST=0.0.0.0`).
+- La base de datos de Docker es distinta de la local, así que los PDFs indexados en una no aparecen en la otra.

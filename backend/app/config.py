@@ -13,13 +13,15 @@ class Settings(BaseSettings):
         env_file=(BACKEND.parent / ".env", BACKEND / ".env"), env_file_encoding="utf-8", extra="ignore"
     )
 
-    database_url: str = "postgresql://chatpdf:chatpdf@localhost:5432/chatpdf"
+    database_url: str = "postgresql://chatpdf:chatpdf@localhost:5433/chatpdf"
 
     max_pages: int = 8
     max_file_mb: int = 20
     chunk_size: int = 900
     chunk_overlap: int = 150
-    top_k: int = 5
+    top_k: int = 6
+    # Si una pregunta general cabe en este presupuesto, se envía el documento completo.
+    full_doc_chars: int = 9000
 
     # Proveedor por defecto: modelo abierto local vía Ollama
     llm_provider: str = "ollama"  # "ollama" | "openai"
@@ -28,6 +30,8 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_chat_model: str = "gemma4:e2b"
     ollama_embed_model: str = "nomic-embed-text"
+    ollama_num_ctx: int = 8192
+    ollama_think: bool = False  # razonamiento previo de modelos como gemma4 (más lento)
 
     # Cualquier API compatible con OpenAI (OpenAI, Groq, OpenRouter, Together, LM Studio...)
     openai_base_url: str = "https://api.openai.com/v1"
