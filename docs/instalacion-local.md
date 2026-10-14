@@ -153,5 +153,5 @@ Abre **<http://localhost:8000>**: la API sirve la interfaz compilada.
 ## Volver a Docker más adelante
 
 - **Solo la base de datos en Docker:** `docker compose up -d` y usa el puerto `5433` en `DATABASE_URL`.
-- **También la app en Docker:** `docker compose --profile app up -d --build`. La app usa el Ollama de tu PC vía `http://host.docker.internal:11434`. Si en el botón **motor** guardaste `http://localhost:11434`, cámbialo mientras uses la app en Docker. En Linux, Ollama debe escuchar en `0.0.0.0` (`OLLAMA_HOST=0.0.0.0`).
+- **También la app en Docker:** `docker compose --profile app up -d --build`. La app usa el Ollama de tu PC vía `http://host.docker.internal:11434`. La URL guardada en el botón **motor** se adapta sola al modo en que corre la app. En Linux, Ollama debe escuchar en `0.0.0.0` (`OLLAMA_HOST=0.0.0.0`).
 - La base de datos de Docker es distinta de la local, así que los PDFs indexados en una no aparecen en la otra.

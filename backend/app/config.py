@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     llm_provider: str = "ollama"  # "ollama" | "openai"
     embed_provider: str = "ollama"
 
-    ollama_base_url: str = "http://localhost:11434"
+    ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_chat_model: str = "gemma4:e2b"
     ollama_embed_model: str = "nomic-embed-text"
     ollama_num_ctx: int = 8192
