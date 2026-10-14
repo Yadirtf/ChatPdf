@@ -310,7 +310,6 @@ input, textarea { font: inherit; color: inherit; }
 }
 .a.is-selected { border-left-color: var(--ember); }
 .thinking { color: var(--ember); text-transform: none; letter-spacing: 0.02em; }
-.thinking::after { content: "…"; animation: blink 1s infinite; }
 
 .md { color: var(--bone); font-size: 15.5px; line-height: 1.7; overflow-wrap: anywhere; }
 .md > :first-child { margin-top: 10px; }
@@ -667,3 +666,17 @@ input, textarea { font: inherit; color: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+.thinking .elapsed { font-style: normal; color: var(--mute); margin-left: 4px; }
+.thinking { display: inline-flex; align-items: center; gap: 6px; }
+.thinking::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--ember);
+  animation: blink 1s infinite;
+}
+.toggle { display: grid; grid-template-columns: auto 1fr; gap: 12px; align-items: start; padding: 12px; border: 1px solid var(--line); border-radius: 12px; cursor: pointer; }
+.toggle input { accent-color: var(--ember); width: 16px; height: 16px; margin-top: 3px; }
+.toggle b { display: block; font-weight: 500; }
+.toggle small { color: var(--mute); font-size: 12.5px; line-height: 1.45; display: block; }

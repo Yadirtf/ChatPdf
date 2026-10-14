@@ -1,10 +1,12 @@
-# Por defecto la app usa el Ollama que ya tienes instalado en tu PC.
-# Dentro de un contenedor "localhost" es el propio contenedor, por eso se
-# llega a tu PC con host.docker.internal y no con localhost.
+# Modo recomendado: solo la base de datos en Docker; la app y Ollama corren en tu PC.
 #
-# ¿No tienes Ollama instalado? Levanta también el de Docker:
-#   DOCKER_OLLAMA_URL=http://ollama:11434 docker compose --profile ollama up -d --build
-# (o pon DOCKER_OLLAMA_URL en .env y usa --profile ollama)
+#   docker compose up -d          → PostgreSQL + pgvector en localhost:5433
+#
+# Perfiles opcionales:
+#   docker compose --profile app up -d --build
+#       también la app en Docker (usa el Ollama de tu PC vía host.docker.internal)
+#   DOCKER_OLLAMA_URL=http://ollama:11434 docker compose --profile app --profile ollama up -d --build
+#       todo en Docker, incluido Ollama
 
 services:
   db:
@@ -22,14 +24,18 @@ services:
       test: ["CMD-SHELL", "pg_isready -U chatpdf"]
       interval: 3s
       retries: 20
+    restart: unless-stopped
 
+  # ---- Opcional: la app dentro de Docker (perfil "app") ----
   app:
     build: .
+    profiles: [app]
     env_file:
       - path: .env
         required: false
     environment:
-      # Estas dos variables pisan las de .env, que apuntan a localhost para el modo sin Docker.
+      # Dentro del contenedor "localhost" es el propio contenedor: estas dos variables
+      # pisan las de .env, que apuntan a localhost para el modo local.
       DATABASE_URL: postgresql://chatpdf:chatpdf@db:5432/chatpdf
       OLLAMA_BASE_URL: ${DOCKER_OLLAMA_URL:-http://host.docker.internal:11434}
     extra_hosts:

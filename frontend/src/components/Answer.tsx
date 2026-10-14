@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Message, Source } from "../api";
@@ -13,6 +14,16 @@ type Props = {
 
 // Convierte "[p. 3]" en enlaces internos que se pintan como chips de cita.
 const withCitations = (text: string) => text.replace(/\[(?:p|pág|pag)\.?\s*(\d+)\]/gi, "[p. $1](#p-$1)");
+
+// Segundos transcurridos: con modelos locales en CPU la primera palabra puede tardar.
+function Elapsed() {
+  const [s, setS] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setS((v) => v + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  return <i className="elapsed">{s}s</i>;
+}
 
 export function Question({ msg, n }: { msg: Message; n: number }) {
   return (
@@ -31,7 +42,11 @@ export function Answer({ msg, model, selected, onSelect, onFocus }: Props) {
     <div className={`a ${selected ? "is-selected" : ""}`} onClick={onSelect}>
       <span className="label mono">
         Respuesta <i>·</i> {model}
-        {msg.pending && !msg.content && <span className="thinking">buscando en el documento</span>}
+        {msg.pending && !msg.content && (
+          <span className="thinking">
+            {(msg.status || "Buscando en el documento").toLowerCase()} <Elapsed />
+          </span>
+        )}
       </span>
 
       {msg.error ? (

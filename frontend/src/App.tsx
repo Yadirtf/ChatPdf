@@ -8,6 +8,7 @@ type Ingest = { name: string; stage: string; pages?: number; total: number; done
 
 const SUGGESTIONS = [
   "Resume el documento en cinco puntos",
+  "¿De qué trata la página 1?",
   "¿Cuál es la idea principal?",
   "Explícalo como si tuviera doce años",
   "¿Qué datos o cifras menciona?",
@@ -144,21 +145,29 @@ export default function App() {
     ]);
     setSelectedId(tmp);
     const patch = (fn: (m: Message) => Message) => setMessages((all) => all.map((m) => (m.id === tmp ? fn(m) : m)));
+    let finished = false;
     const ctrl = new AbortController();
     abort.current = ctrl;
     try {
       for await (const ev of api.chat(activeId, q, ctrl.signal)) {
-        if (ev.type === "sources") patch((m) => ({ ...m, sources: { query: ev.query, items: ev.sources } }));
+        if (ev.type === "status") patch((m) => ({ ...m, status: ev.text }));
+        else if (ev.type === "sources") patch((m) => ({ ...m, sources: { query: ev.query, items: ev.sources } }));
         else if (ev.type === "token") patch((m) => ({ ...m, content: m.content + ev.text }));
-        else if (ev.type === "error") patch((m) => ({ ...m, pending: false, error: ev.error }));
-        else if (ev.type === "done") {
+        else if (ev.type === "error") {
+          finished = true;
+          patch((m) => ({ ...m, pending: false, error: ev.error }));
+        } else if (ev.type === "done") {
+          finished = true;
           patch((m) => ({ ...m, pending: false, id: ev.message_id }));
           setSelectedId(ev.message_id);
         }
       }
     } catch (e: any) {
+      finished = true;
       if (e.name !== "AbortError") patch((m) => ({ ...m, pending: false, error: e.message }));
     } finally {
+      if (!finished)
+        patch((m) => ({ ...m, error: "La conexión con el servidor se cortó antes de terminar la respuesta." }));
       patch((m) => ({ ...m, pending: false }));
       setBusy(false);
     }

@@ -32,6 +32,7 @@ def defaults() -> dict:
             "base_url": settings.ollama_base_url,
             "chat_model": settings.ollama_chat_model,
             "embed_model": settings.ollama_embed_model,
+            "think": "true" if settings.ollama_think else "false",
         },
         "openai": {
             "base_url": settings.openai_base_url,
@@ -148,33 +149,54 @@ def embed(texts: list[str], provider: str, model: str, cfg: dict | None = None) 
 
 # ---------- Chat (streaming) ----------
 
-def chat_stream(messages: list[dict], cfg: dict | None = None) -> Iterator[str]:
+def _ollama_chat(p: dict, messages: list[dict], think: bool | None) -> Iterator[tuple[str, str]]:
+    body = {
+        "model": p["chat_model"],
+        "messages": messages,
+        "stream": True,
+        # Mantiene el modelo cargado entre preguntas para no recargarlo cada vez.
+        "keep_alive": "30m",
+        # El contexto por defecto de Ollama (2–4k tokens) recorta los fragmentos del PDF.
+        "options": {"temperature": 0.2, "num_ctx": settings.ollama_num_ctx},
+    }
+    if think is not None:
+        body["think"] = think
+    with httpx.stream("POST", f"{p['base_url'].rstrip('/')}/api/chat", json=body, timeout=TIMEOUT) as r:
+        if not r.is_success:
+            r.read()
+            _raise(r, "Ollama")
+        for line in r.iter_lines():
+            if not line:
+                continue
+            data = json.loads(line)
+            if data.get("error"):
+                raise ProviderError(f"Ollama: {data['error']}")
+            msg = data.get("message") or {}
+            if msg.get("thinking"):
+                yield "thinking", msg["thinking"]
+            if msg.get("content"):
+                yield "content", msg["content"]
+            if data.get("done"):
+                return
+
+
+def chat_stream(messages: list[dict], cfg: dict | None = None) -> Iterator[tuple[str, str]]:
+    """Emite ("thinking", texto) mientras el modelo razona y ("content", texto) con la respuesta."""
     cfg = cfg or load()
     provider = cfg["llm_provider"]
     p = cfg[provider]
     try:
         if provider == "ollama":
-            with httpx.stream(
-                "POST",
-                f"{p['base_url'].rstrip('/')}/api/chat",
-                json={"model": p["chat_model"], "messages": messages, "stream": True,
-                      "options": {"temperature": 0.2}},
-                timeout=TIMEOUT,
-            ) as r:
-                if not r.is_success:
-                    r.read()
-                    _raise(r, "Ollama")
-                for line in r.iter_lines():
-                    if not line:
-                        continue
-                    data = json.loads(line)
-                    if data.get("error"):
-                        raise ProviderError(f"Ollama: {data['error']}")
-                    piece = (data.get("message") or {}).get("content")
-                    if piece:
-                        yield piece
-                    if data.get("done"):
-                        return
+            # Los modelos con razonamiento (Gemma 4, Qwen 3, DeepSeek R1...) piensan antes de
+            # responder; en CPU eso puede tardar minutos sin mostrar nada. Por defecto se apaga.
+            think = str(p.get("think", "false")).lower() == "true"
+            try:
+                yield from _ollama_chat(p, messages, think)
+            except ProviderError as e:
+                # Los modelos sin razonamiento rechazan el parámetro "think": se reintenta sin él.
+                if "think" not in str(e).lower():
+                    raise
+                yield from _ollama_chat(p, messages, None)
             return
 
         with httpx.stream(
@@ -196,9 +218,12 @@ def chat_stream(messages: list[dict], cfg: dict | None = None) -> Iterator[str]:
                 data = json.loads(payload)
                 choices = data.get("choices") or []
                 if choices:
-                    piece = (choices[0].get("delta") or {}).get("content")
-                    if piece:
-                        yield piece
+                    delta = choices[0].get("delta") or {}
+                    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                    if reasoning:
+                        yield "thinking", reasoning
+                    if delta.get("content"):
+                        yield "content", delta["content"]
     except httpx.HTTPError as e:
         raise _unreachable(provider, p["base_url"], e) from e
 
