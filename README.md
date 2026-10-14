@@ -49,7 +49,7 @@ npm run build
 
 Abre **http://localhost:8000**. Para editar la interfaz con recarga en vivo, usa `npm run dev` y abre http://localhost:5173.
 
-> Si en el botón **motor** guardaste antes otra URL de Ollama (por ejemplo `host.docker.internal`), vuelve a poner `http://localhost:11434`: lo guardado ahí tiene prioridad sobre `.env`.
+> La URL de Ollama se adapta sola: si guardaste `host.docker.internal` y la app corre en tu PC, se usa `127.0.0.1`; si guardaste `localhost` y la app corre en Docker, se usa `host.docker.internal`.
 
 ### Otras formas de ejecutarlo
 

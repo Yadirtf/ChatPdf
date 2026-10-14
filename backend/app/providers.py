@@ -54,7 +54,32 @@ def load() -> dict:
                 cfg[key] = stored[key]
         for p in PROVIDERS:
             cfg[p].update({k: v for k, v in (stored.get(p) or {}).items() if k in cfg[p]})
+    for p in PROVIDERS:
+        cfg[p]["base_url"] = _fit_host(cfg[p]["base_url"])
     return cfg
+
+
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _fit_host(url: str) -> str:
+    """Ajusta una URL guardada al lugar donde corre la API.
+
+    host.docker.internal solo existe dentro de Docker y localhost dentro de un
+    contenedor es el propio contenedor. Si la URL se guardó en un modo y la API
+    corre en el otro, se traduce para que siga llegando al mismo servicio del PC.
+    """
+    parts = urlparse(url)
+    host = parts.hostname or ""
+    if IN_DOCKER and host in _LOCAL_HOSTS:
+        new = "host.docker.internal"
+    elif not IN_DOCKER and host == "host.docker.internal":
+        # 127.0.0.1 y no "localhost": en Windows localhost resuelve primero a ::1 y Ollama solo escucha en IPv4.
+        new = "127.0.0.1"
+    else:
+        return url
+    netloc = new + (f":{parts.port}" if parts.port else "")
+    return parts._replace(netloc=netloc).geturl()
 
 
 def save(patch: dict) -> dict:
@@ -69,7 +94,7 @@ def save(patch: dict) -> dict:
             # La UI nunca recibe la clave completa: si la devuelve enmascarada, se conserva.
             if k == "api_key" and isinstance(v, str) and v.startswith("•"):
                 continue
-            cfg[p][k] = str(v).strip()
+            cfg[p][k] = _fit_host(str(v).strip()) if k == "base_url" else str(v).strip()
     with db.conn() as c:
         c.execute(
             "INSERT INTO app_settings(key, value) VALUES ('providers', %s) "
