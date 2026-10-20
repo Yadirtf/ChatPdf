@@ -1,27 +1,26 @@
-# Modo recomendado: solo la base de datos en Docker; la app y Ollama corren en tu PC.
+# Modo recomendado: solo la base de datos en Docker; la app y los modelos corren en tu PC.
 #
-#   docker compose up -d          → PostgreSQL + pgvector en localhost:5433
+#   docker compose up -d          → PostgreSQL 16 + pgvector 0.8 en localhost:5433
 #
-# Perfiles opcionales:
+# Opcional:
 #   docker compose --profile app up -d --build
-#       también la app en Docker (usa el Ollama de tu PC vía host.docker.internal)
-#   DOCKER_OLLAMA_URL=http://ollama:11434 docker compose --profile app --profile ollama up -d --build
-#       todo en Docker, incluido Ollama
+#       también la app en Docker. Usa el llama.cpp / Ollama de tu PC vía host.docker.internal
+#       y lee la carpeta ./conocimiento.
 
 services:
   db:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_USER: chatpdf
-      POSTGRES_PASSWORD: chatpdf
-      POSTGRES_DB: chatpdf
+      POSTGRES_USER: astrolabio
+      POSTGRES_PASSWORD: astrolabio
+      POSTGRES_DB: astrolabio
     ports:
       # 5433 en tu PC para no chocar con un PostgreSQL local en 5432
       - "5433:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - astrolabio-pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U chatpdf"]
+      test: ["CMD-SHELL", "pg_isready -U astrolabio"]
       interval: 3s
       retries: 20
     restart: unless-stopped
@@ -34,45 +33,23 @@ services:
       - path: .env
         required: false
     environment:
-      # Dentro del contenedor "localhost" es el propio contenedor: estas dos variables
-      # pisan las de .env, que apuntan a localhost para el modo local.
-      DATABASE_URL: postgresql://chatpdf:chatpdf@db:5432/chatpdf
-      OLLAMA_BASE_URL: ${DOCKER_OLLAMA_URL:-http://host.docker.internal:11434}
+      # Dentro del contenedor "localhost" es el propio contenedor. Las URLs de modelos que
+      # apuntan a localhost se traducen solas a host.docker.internal.
+      DATABASE_URL: postgresql://astrolabio:astrolabio@db:5432/astrolabio
+      KNOWLEDGE_DIR: /conocimiento
+      # En carpetas montadas desde Windows o macOS los eventos de archivos no llegan al contenedor.
+      SCAN_INTERVAL: 10
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      - ./conocimiento:/conocimiento
+      - whisper-models:/root/.cache/huggingface
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
 
-  # ---- Opcional: Ollama dentro de Docker (perfil "ollama") ----
-  ollama:
-    image: ollama/ollama:latest
-    profiles: [ollama]
-    ports:
-      # 11435 en tu PC para no chocar con un Ollama local en 11434
-      - "11435:11434"
-    volumes:
-      - ollama:/root/.ollama
-    # Con GPU NVIDIA, descomenta:
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
-
-  # Descarga una sola vez los modelos de chat y embeddings en el Ollama de Docker.
-  ollama-pull:
-    image: ollama/ollama:latest
-    profiles: [ollama]
-    depends_on: [ollama]
-    environment:
-      OLLAMA_HOST: http://ollama:11434
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - "sleep 3 && ollama pull ${OLLAMA_CHAT_MODEL:-gemma4:e2b} && ollama pull ${OLLAMA_EMBED_MODEL:-nomic-embed-text}"
-    restart: "no"
-
 volumes:
-  pgdata:
-  ollama:
+  astrolabio-pgdata:
+  whisper-models:

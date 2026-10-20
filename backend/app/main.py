@@ -1,29 +1,36 @@
 import json
 import logging
+import os
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db, providers, rag
 from .config import BACKEND, settings
-from .pdf import PdfError
+from .ingest import KINDS, kind_of
+from .library import library
+from .media import whisper_loaded
 
-log = logging.getLogger("chatpdf")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("astrolabio")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init_db()
+    library.start()
     yield
+    library.stop()
     db.close_db()
 
 
-app = FastAPI(title="ChatPdf", lifespan=lifespan)
+app = FastAPI(title="Astrolabio", lifespan=lifespan)
 
 
 def ndjson(events):
@@ -32,38 +39,46 @@ def ndjson(events):
         try:
             for ev in events:
                 yield json.dumps(ev, ensure_ascii=False, default=str) + "\n"
-        except (PdfError, ValueError, LookupError, providers.ProviderError) as e:
-            yield json.dumps({"type": "error", "stage": "error", "error": str(e)}, ensure_ascii=False) + "\n"
+        except (ValueError, LookupError, providers.ProviderError) as e:
+            yield json.dumps({"type": "error", "error": str(e)}, ensure_ascii=False) + "\n"
         except Exception as e:  # noqa: BLE001
             log.exception("Error inesperado")
-            yield json.dumps({"type": "error", "stage": "error", "error": f"Error interno: {e}"}) + "\n"
+            yield json.dumps({"type": "error", "error": f"Error interno: {e}"}) + "\n"
     return StreamingResponse(gen(), media_type="application/x-ndjson",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ---------- Estado y configuración ----------
 
+def _check(section: str, cfg: dict) -> dict:
+    try:
+        models = providers.list_models(section, cfg, timeout=4)
+    except providers.ProviderError as e:
+        return {"ok": False, "error": str(e)}
+    if section == "ollama":
+        # Ollama nombra "modelo:latest" cuando no se indica etiqueta.
+        have = set(models) | {m.removesuffix(":latest") for m in models}
+        if cfg["ollama"]["chat_model"] not in have:
+            return {"ok": False, "error": f"Falta descargar: ollama pull {cfg['ollama']['chat_model']}"}
+    return {"ok": True}
+
+
 @app.get("/api/health")
 def health():
     cfg = providers.load()
-    status = {"db": True, "limits": {"max_pages": settings.max_pages, "max_file_mb": settings.max_file_mb}}
-    try:
-        provider = cfg["llm_provider"]
-        models = providers.list_models(provider, cfg)
-        status["llm"] = {"ok": True, "provider": provider, "models": len(models)}
-        if provider == "ollama":
-            # Ollama nombra "modelo:latest" cuando no se indica etiqueta.
-            have = set(models) | {m.removesuffix(":latest") for m in models}
-            wanted = {cfg["ollama"]["chat_model"]}
-            if cfg["embed_provider"] == "ollama":
-                wanted.add(cfg["ollama"]["embed_model"])
-            missing = sorted(m for m in wanted if m not in have)
-            if missing:
-                status["llm"] = {"ok": False, "provider": provider,
-                                 "error": "Falta descargar: " + ", ".join(f"ollama pull {m}" for m in missing)}
-    except providers.ProviderError as e:
-        status["llm"] = {"ok": False, "provider": cfg["llm_provider"], "error": str(e)}
-    return status
+    checks = {s: _check(s, cfg) for s in {cfg["chat_provider"], cfg["vision_provider"], "embed"}}
+    return {
+        "db": True,
+        "limits": {"max_pages": settings.max_pages, "max_file_mb": settings.max_file_mb,
+                   "max_media_minutes": settings.max_media_minutes, "extensions": sorted(KINDS)},
+        "chat": {"provider": cfg["chat_provider"], "model": providers.model_label(cfg["chat_provider"], cfg),
+                 **checks[cfg["chat_provider"]]},
+        "vision": {"provider": cfg["vision_provider"], "model": providers.model_label(cfg["vision_provider"], cfg),
+                   **checks[cfg["vision_provider"]]},
+        "embed": {"model": cfg["embed"]["model"], "dim": settings.embed_dim, **checks["embed"]},
+        "whisper": {"model": settings.whisper_model, "loaded": whisper_loaded()},
+        "library": library.status(),
+    }
 
 
 @app.get("/api/settings")
@@ -73,82 +88,173 @@ def get_settings():
 
 @app.put("/api/settings")
 def put_settings(patch: dict):
-    return providers.public(providers.save(patch))
+    cfg = providers.save(patch)
+    library.settings_changed(cfg)
+    return providers.public(cfg)
 
 
-@app.get("/api/models/{provider}")
-def models(provider: str):
-    if provider not in providers.PROVIDERS:
+@app.get("/api/models/{section}")
+def models(section: str):
+    if section not in providers.SECTIONS:
         raise HTTPException(404, "Proveedor desconocido")
     try:
-        return {"models": providers.list_models(provider)}
+        return {"models": providers.list_models(section)}
     except providers.ProviderError as e:
         raise HTTPException(502, str(e)) from e
 
 
-# ---------- Documentos ----------
+# ---------- Base de conocimiento ----------
 
-@app.get("/api/documents")
-def list_documents():
+_SOURCE_COLUMNS = "id, path, name, kind, size_bytes, status, error, meta, chunk_count, created_at, updated_at"
+
+
+def _serialize(r: dict) -> dict:
+    out = {**r, "id": str(r["id"])}
+    if r["status"] == "processing":
+        out["progress"] = library.progress.get(out["id"])
+    return out
+
+
+@app.get("/api/sources")
+def list_sources():
     with db.conn() as c:
-        rows = c.execute(
-            "SELECT id, name, pages, size_bytes, chunk_count, embed_provider, embed_model, created_at "
-            "FROM documents ORDER BY created_at DESC"
-        ).fetchall()
-    return [rag.serialize_doc(r) for r in rows]
+        rows = c.execute(f"SELECT {_SOURCE_COLUMNS} FROM sources ORDER BY created_at DESC").fetchall()
+    return {"sources": [_serialize(r) for r in rows], "library": library.status()}
 
 
-@app.post("/api/documents")
-async def upload(file: UploadFile = File(...)):
-    name = Path(file.filename or "documento.pdf").name
-    data = await file.read(settings.max_file_mb * 1024 * 1024 + 1)
-    if len(data) > settings.max_file_mb * 1024 * 1024:
-        raise HTTPException(413, f"El archivo supera {settings.max_file_mb} MB.")
-    if not data.startswith(b"%PDF"):
-        raise HTTPException(415, "Solo se aceptan archivos PDF.")
-    return ndjson(rag.ingest(name, data))
+def _free_name(name: str) -> Path:
+    target = library.root / name
+    stem, suffix, n = target.stem, target.suffix, 2
+    while target.exists():
+        target = library.root / f"{stem} ({n}){suffix}"
+        n += 1
+    return target
 
 
-@app.delete("/api/documents/{doc_id}", status_code=204)
-def delete_document(doc_id: UUID):
+@app.post("/api/sources")
+async def upload(files: list[UploadFile] = File(...)):
+    """Guarda los archivos en la carpeta de conocimiento; el vigilante se encarga del resto."""
+    limit = settings.max_file_mb * 1024 * 1024
+    saved, rejected = [], []
+    for f in files:
+        name = Path(f.filename or "archivo").name
+        if not kind_of(Path(name)):
+            rejected.append({"name": name, "error": "Formato no admitido."})
+            continue
+        tmp = library.root / f".{uuid.uuid4().hex}.part"
+        size = 0
+        try:
+            with tmp.open("wb") as out:
+                while block := await f.read(1 << 20):
+                    size += len(block)
+                    if size > limit:
+                        raise ValueError(f"Supera {settings.max_file_mb} MB.")
+                    out.write(block)
+            target = _free_name(name)
+            os.replace(tmp, target)
+            saved.append(target.relative_to(library.root).as_posix())
+        except ValueError as e:
+            rejected.append({"name": name, "error": str(e)})
+        finally:
+            tmp.unlink(missing_ok=True)
+    library.scan()
     with db.conn() as c:
-        c.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
+        rows = c.execute(f"SELECT {_SOURCE_COLUMNS} FROM sources WHERE path = ANY(%s)", (saved,)).fetchall()
+    return {"sources": [_serialize(r) for r in rows], "rejected": rejected}
 
 
-@app.get("/api/documents/{doc_id}/map")
-def document_map(doc_id: UUID):
+def _source(source_id: UUID) -> dict:
     with db.conn() as c:
-        rows = c.execute(
-            "SELECT id, idx, page, x, y, left(content, 220) AS preview FROM chunks "
-            "WHERE document_id = %s ORDER BY idx",
-            (doc_id,),
-        ).fetchall()
-    return rows
+        row = c.execute("SELECT id, path, name, kind FROM sources WHERE id = %s", (source_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Fuente no encontrada")
+    return row
 
 
-@app.get("/api/documents/{doc_id}/messages")
-def messages(doc_id: UUID):
+@app.delete("/api/sources/{source_id}", status_code=204)
+def delete_source(source_id: UUID):
+    """Borra el archivo de la carpeta (si no, el vigilante lo volvería a indexar) y su índice."""
+    src = _source(source_id)
+    try:
+        (library.root / src["path"]).unlink(missing_ok=True)
+    except PermissionError as e:
+        raise HTTPException(409, "El archivo está abierto en otro programa; ciérralo y vuelve a intentarlo.") from e
+    library.scan()
+
+
+@app.post("/api/sources/{source_id}/retry", status_code=202)
+def retry_source(source_id: UUID):
+    _source(source_id)
+    with db.conn() as c:
+        c.execute("UPDATE sources SET status = 'queued', error = NULL WHERE id = %s", (source_id,))
+    library.enqueue("ingest", str(source_id))
+
+
+@app.get("/api/sources/{source_id}/file")
+def source_file(source_id: UUID):
+    """El archivo original, para abrir el PDF en su página o reproducir el audio en su minuto."""
+    src = _source(source_id)
+    path = (library.root / src["path"]).resolve()
+    if library.root not in path.parents or not path.is_file():
+        raise HTTPException(404, "El archivo ya no está en la carpeta")
+    return FileResponse(path, filename=src["name"], content_disposition_type="inline")
+
+
+@app.post("/api/library/scan")
+def scan():
+    library.scan()
+    return library.status()
+
+
+@app.post("/api/library/reembed", status_code=202)
+def reembed():
+    library.reembed_all()
+    return library.status()
+
+
+@app.get("/api/map")
+def knowledge_map():
     with db.conn() as c:
         return c.execute(
-            "SELECT id, role, content, sources, created_at FROM messages "
-            "WHERE document_id = %s ORDER BY id",
-            (doc_id,),
+            "SELECT c.id, c.source_id::text, c.idx, c.modality, c.page, c.t_start, c.x, c.y, "
+            "left(c.content, 220) AS preview, s.name FROM chunks c JOIN sources s ON s.id = c.source_id "
+            "WHERE c.embedding IS NOT NULL ORDER BY c.source_id, c.idx LIMIT 5000"
         ).fetchall()
 
 
-@app.delete("/api/documents/{doc_id}/messages", status_code=204)
-def clear_messages(doc_id: UUID):
+@app.get("/api/assets/{asset_id}")
+def asset(asset_id: int):
     with db.conn() as c:
-        c.execute("DELETE FROM messages WHERE document_id = %s", (doc_id,))
+        row = c.execute("SELECT mime, data FROM assets WHERE id = %s", (asset_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Imagen no encontrada")
+    # El contenido de un id nunca cambia (se identifica por hash): se puede guardar en caché.
+    return Response(bytes(row["data"]), media_type=row["mime"],
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+# ---------- Conversación ----------
+
+@app.get("/api/messages")
+def messages():
+    with db.conn() as c:
+        return c.execute("SELECT id, role, content, sources, created_at FROM messages ORDER BY id").fetchall()
+
+
+@app.delete("/api/messages", status_code=204)
+def clear_messages():
+    with db.conn() as c:
+        c.execute("DELETE FROM messages")
 
 
 class Ask(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    scope: list[UUID] = Field(default_factory=list, max_length=50)
 
 
-@app.post("/api/documents/{doc_id}/chat")
-def chat(doc_id: UUID, body: Ask):
-    return ndjson(rag.answer(str(doc_id), body.message.strip()))
+@app.post("/api/chat")
+def chat(body: Ask):
+    return ndjson(rag.answer(body.message.strip(), [str(s) for s in body.scope]))
 
 
 # ---------- Frontend compilado ----------
