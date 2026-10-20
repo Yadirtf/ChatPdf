@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import type { Source, Star } from "../api";
+import { locator, MODALITY_LABEL, type Hit, type Modality, type Star } from "../api";
 
 type Props = {
   stars: Star[];
   forming: { total: number; done: number } | null;
   query: { x: number; y: number } | null;
-  hits: Source[];
+  hits: Hit[];
   focus: number | null;
+  scope: string[];
   onPick?: (star: Star) => void;
 };
 
@@ -15,6 +16,13 @@ type Node = { star: Star; x: number; y: number; seed: number };
 const INK = "12, 11, 10";
 const BONE = "237, 231, 220";
 const EMBER = "255, 92, 57";
+// Color de cada modalidad: texto en hueso, lo visual en verde agua y la voz en oro.
+export const TINT: Record<Modality, string> = {
+  text: BONE,
+  image: "118, 214, 196",
+  frame: "118, 214, 196",
+  speech: "236, 196, 104",
+};
 const reduceMotion = () => window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 /** Posición de la partícula i en el anillo de "formación" mientras se vectoriza el PDF. */
@@ -24,15 +32,15 @@ function ringPos(i: number, total: number, t: number) {
   return { x: Math.cos(a) * r, y: Math.sin(a) * r };
 }
 
-export default function Constellation({ stars, forming, query, hits, focus, onPick }: Props) {
+export default function Constellation({ stars, forming, query, hits, focus, scope, onPick }: Props) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const nodes = useRef<Map<number, Node>>(new Map());
-  const props = useRef({ forming, query, hits, focus });
+  const props = useRef({ forming, query, hits, focus, scope });
   const hitAt = useRef<number>(0);
   const mouse = useRef<{ x: number; y: number } | null>(null);
   const [hover, setHover] = useState<{ star: Star; px: number; py: number } | null>(null);
 
-  props.current = { forming, query, hits, focus };
+  props.current = { forming, query, hits, focus, scope };
 
   useEffect(() => {
     hitAt.current = performance.now();
@@ -75,7 +83,8 @@ export default function Constellation({ stars, forming, query, hits, focus, onPi
 
     const frame = (t: number) => {
       const still = reduceMotion();
-      const { forming, query, hits, focus } = props.current;
+      const { forming, query, hits, focus, scope } = props.current;
+      const inScope = (n: Node) => !scope.length || scope.includes(n.star.source_id);
       const R = Math.min(W, H) * 0.4;
       const cx = W / 2;
       const cy = H / 2;
@@ -127,7 +136,9 @@ export default function Constellation({ stars, forming, query, hits, focus, onPi
       }
 
       // Mover nodos hacia su destino con una leve deriva
-      const list = [...nodes.current.values()].sort((a, b) => a.star.idx - b.star.idx);
+      const list = [...nodes.current.values()].sort(
+        (a, b) => a.star.source_id.localeCompare(b.star.source_id) || a.star.idx - b.star.idx,
+      );
       for (const n of list) {
         const drift = still ? 0 : 0.006;
         const tx = n.star.x + Math.sin(t * 0.0006 + n.seed) * drift;
@@ -136,17 +147,15 @@ export default function Constellation({ stars, forming, query, hits, focus, onPi
         n.y += (ty - n.y) * (still ? 1 : 0.045);
       }
 
-      // Hilo de lectura: une los fragmentos en el orden del documento
-      if (list.length > 1) {
-        ctx.strokeStyle = `rgba(${BONE}, 0.09)`;
-        ctx.beginPath();
-        list.forEach((n, i) => {
-          const [x, y] = P(n.x, n.y);
-          if (i) ctx.lineTo(x, y);
-          else ctx.moveTo(x, y);
-        });
-        ctx.stroke();
-      }
+      // Hilo de lectura: une los fragmentos de cada fuente en su orden
+      ctx.strokeStyle = `rgba(${BONE}, 0.08)`;
+      ctx.beginPath();
+      list.forEach((n, i) => {
+        const [x, y] = P(n.x, n.y);
+        if (i && list[i - 1].star.source_id === n.star.source_id) ctx.lineTo(x, y);
+        else ctx.moveTo(x, y);
+      });
+      ctx.stroke();
 
       // Rayos desde la consulta hacia los fragmentos recuperados
       const hitRank = new Map(hits.map((h, i) => [h.chunk_id, i]));
@@ -193,21 +202,25 @@ export default function Constellation({ stars, forming, query, hits, focus, onPi
         const isHit = rank !== undefined;
         const isFocus = focus === n.star.id;
         const tw = still ? 1 : 0.75 + Math.sin(t * 0.003 + n.seed) * 0.25;
-        const r = isHit ? 3.6 - rank * 0.25 : 1.8;
+        const r = isHit ? Math.max(2.4, 3.6 - rank * 0.15) : 1.8;
+        const tint = TINT[n.star.modality];
+        const dim = inScope(n) ? 1 : 0.25;
 
-        ctx.fillStyle = isHit ? `rgba(${EMBER}, 0.14)` : `rgba(${BONE}, ${0.06 * tw})`;
+        ctx.fillStyle = isHit ? `rgba(${EMBER}, 0.14)` : `rgba(${tint}, ${0.07 * tw * dim})`;
         ctx.beginPath();
         ctx.arc(x, y, r * 4, 0, Math.PI * 2);
         ctx.fill();
-        ctx.fillStyle = isHit ? `rgb(${EMBER})` : `rgba(${BONE}, ${0.55 + 0.45 * tw})`;
+        ctx.fillStyle = isHit ? `rgb(${EMBER})` : `rgba(${tint}, ${(0.55 + 0.45 * tw) * dim})`;
         ctx.beginPath();
-        ctx.arc(x, y, r, 0, Math.PI * 2);
+        // Lo visual se dibuja como un cuadrado: se distingue también sin color.
+        if (n.star.modality === "image" || n.star.modality === "frame") ctx.rect(x - r, y - r, r * 2, r * 2);
+        else ctx.arc(x, y, r, 0, Math.PI * 2);
         ctx.fill();
 
         if (isHit) {
           ctx.fillStyle = `rgba(${EMBER}, 0.95)`;
           ctx.font = "10px 'Geist Mono', monospace";
-          ctx.fillText(`${rank + 1}·p${n.star.page}`, x + 8, y + 3);
+          ctx.fillText(String(hits[rank].n), x + 8, y + 3);
         }
         if (isFocus) {
           ctx.strokeStyle = `rgba(${BONE}, 0.9)`;
@@ -260,14 +273,16 @@ export default function Constellation({ stars, forming, query, hits, focus, onPi
         onMouseLeave={() => (mouse.current = null)}
         onClick={() => hover && onPick?.(hover.star)}
         style={{ cursor: hover ? "pointer" : "crosshair" }}
-        aria-label="Mapa de fragmentos del documento"
+        aria-label="Mapa de los fragmentos de la base de conocimiento"
         role="img"
       />
       {hover && (
         <div className="star-tip" style={{ left: hover.px, top: hover.py }}>
           <span className="mono">
-            frag {String(hover.star.idx + 1).padStart(2, "0")} · pág {hover.star.page}
+            {MODALITY_LABEL[hover.star.modality]}
+            {locator(hover.star) && ` · ${locator(hover.star)}`}
           </span>
+          <b>{hover.star.name}</b>
           <p>{hover.star.preview}…</p>
         </div>
       )}

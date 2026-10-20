@@ -1,117 +1,37 @@
-"""Indexación (PDF → chunks → embeddings → pgvector) y respuesta con recuperación."""
+"""Consulta semántica sobre toda la base y respuesta con citas a los fragmentos usados."""
 
 import re
 from collections.abc import Iterator
+from itertools import chain
 
 import numpy as np
 from psycopg.types.json import Jsonb
 
 from . import db, providers
 from .config import settings
-from .pdf import chunk_pages, read_pages
+from .ingest import MODALITY_LABEL, Piece
+from .library import library, project
 
-EMBED_BATCH = 16
+SYSTEM_PROMPT = """Eres Astrolabio, un asistente que responde preguntas sobre una base de conocimiento formada por documentos PDF, imágenes, audios y videos.
+Respondes usando únicamente los fragmentos numerados que vienen en el mensaje del usuario.
 
-SYSTEM_PROMPT = """Eres ChatPdf, un asistente que explica documentos PDF.
-Respondes usando únicamente el texto del documento que viene en el mensaje del usuario.
+Qué es cada fragmento:
+- «texto»: texto de un PDF.
+- «imagen» y «fotograma»: descripción de una imagen de un PDF, de una imagen suelta o de una escena de video, escrita por un modelo de visión. Si además recibes la imagen, mírala para precisar.
+- «transcripción»: lo que se dice en un audio o un video, con su marca de tiempo.
 
 Cómo responder:
-- Explica con claridad y con tus propias palabras. Cuando ayude, organiza la respuesta en puntos o pasos y apóyate en ejemplos o datos del texto.
-- Cita la página de donde sale cada dato con el formato [p. N].
-- Si te preguntan por una página concreta, explica de qué trata esa página, sus ideas principales y los datos importantes que contiene.
-- Si te piden un resumen o de qué trata el documento, recorre las ideas principales en orden.
-- Si la respuesta no está en el texto, dilo con claridad y menciona qué temas sí cubre el documento. No inventes información.
+- Explica con claridad y con tus propias palabras; usa puntos o pasos cuando ayude.
+- Cita cada dato con el número de su fragmento entre corchetes, por ejemplo [2] o [1][4].
+- Si un dato sale de una imagen o de un video, dilo: «en el gráfico de la página 3…», «hacia el 01:20 del video…».
+- Si te preguntan por una página o un momento concreto, explica qué contiene y sus datos importantes.
+- Si los fragmentos no contienen la respuesta, dilo con claridad y menciona qué temas sí cubren. No inventes.
 - Responde en el mismo idioma de la pregunta."""
 
-
-# ---------- Proyección 2D (para el mapa de constelación de la UI) ----------
-
-def _projection(vectors: np.ndarray) -> dict:
-    mean = vectors.mean(axis=0)
-    centered = vectors - mean
-    if len(vectors) >= 3:
-        _, _, vt = np.linalg.svd(centered, full_matrices=False)
-        comps = vt[:2]
-    else:
-        rng = np.random.default_rng(7)
-        comps = rng.standard_normal((2, vectors.shape[1]))
-        comps /= np.linalg.norm(comps, axis=1, keepdims=True)
-    pts = centered @ comps.T
-    scale = float(np.abs(pts).max()) or 1.0
-    return {"mean": mean.tolist(), "components": comps.tolist(), "scale": scale}
+CANDIDATES = 40   # por cada búsqueda (vectorial y por palabras) antes de fusionar
 
 
-def _project(vec, proj: dict) -> tuple[float, float]:
-    v = np.asarray(vec, dtype=np.float64) - np.asarray(proj["mean"])
-    x, y = (np.asarray(proj["components"]) @ v) / proj["scale"]
-    return float(np.clip(x, -1.2, 1.2)), float(np.clip(y, -1.2, 1.2))
-
-
-# ---------- Indexación ----------
-
-def ingest(name: str, data: bytes) -> Iterator[dict]:
-    """Procesa el PDF emitiendo eventos de progreso para la animación de la UI."""
-    yield {"stage": "reading"}
-    pages = read_pages(data, settings.max_pages)
-    yield {"stage": "read", "pages": len(pages)}
-
-    chunks = chunk_pages(pages, settings.chunk_size, settings.chunk_overlap)
-    if not chunks:
-        raise ValueError(
-            "No se encontró texto en el PDF. Si es un escaneo, primero aplícale OCR."
-        )
-    yield {"stage": "chunked", "chunks": len(chunks)}
-
-    cfg = providers.load()
-    provider = cfg["embed_provider"]
-    model = cfg[provider]["embed_model"]
-    vectors: list[list[float]] = []
-    for i in range(0, len(chunks), EMBED_BATCH):
-        batch = chunks[i:i + EMBED_BATCH]
-        vectors.extend(providers.embed([c.content for c in batch], provider, model, cfg))
-        yield {"stage": "embedding", "done": len(vectors), "total": len(chunks)}
-
-    arr = np.asarray(vectors, dtype=np.float64)
-    proj = _projection(arr)
-    points = [_project(v, proj) for v in arr]
-
-    with db.conn() as c, c.transaction():
-        doc = c.execute(
-            """INSERT INTO documents(name, pages, size_bytes, chunk_count, embed_provider,
-                                     embed_model, embed_dim, projection)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-               RETURNING id, name, pages, size_bytes, chunk_count, embed_provider,
-                         embed_model, created_at""",
-            (name, len(pages), len(data), len(chunks), provider, model, arr.shape[1], Jsonb(proj)),
-        ).fetchone()
-        with c.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO chunks(document_id, idx, page, content, embedding, x, y) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                [
-                    (doc["id"], ch.idx, ch.page, ch.content, np.asarray(v, dtype=np.float32), x, y)
-                    for ch, v, (x, y) in zip(chunks, vectors, points)
-                ],
-            )
-    yield {"stage": "done", "document": serialize_doc(doc)}
-
-
-def serialize_doc(d: dict) -> dict:
-    return {
-        "id": str(d["id"]),
-        "name": d["name"],
-        "pages": d["pages"],
-        "size_bytes": d["size_bytes"],
-        "chunk_count": d["chunk_count"],
-        "embed_provider": d["embed_provider"],
-        "embed_model": d["embed_model"],
-        "created_at": d["created_at"].isoformat(),
-    }
-
-
-# ---------- Chat ----------
-
-# ---------- Recuperación ----------
+# ---------- Comprensión de la pregunta ----------
 
 _ORDINALS = {
     "primera": 1, "primer": 1, "segunda": 2, "tercera": 3, "cuarta": 4, "quinta": 5,
@@ -120,9 +40,12 @@ _ORDINALS = {
 _PAGE_WORD = r"(?:p[áa]gina|p[áa]g\.?|hoja|page|p\.)"
 _GENERAL = re.compile(
     r"\b(resum\w*|de qu[ée] (trata|habla|se trata)|tema (principal|central)|ideas? (principal|clave|central)\w*|"
-    r"todo el documento|el documento completo|explica(me)? el documento|summar\w*|overview|what is (it|this) about)\b",
+    r"qu[ée] (contiene|hay en)|todo el (documento|audio|video)|completo|panorama|"
+    r"explica(me)? (el|la) (documento|audio|video|imagen)|summar\w*|overview|what is (it|this) about)\b",
     re.IGNORECASE,
 )
+_VISUAL = re.compile(r"\b(imagen|imágenes|imagenes|foto\w*|figura|gráfic\w*|grafic\w*|diagrama|tabla|esquema|"
+                     r"escena|fotograma|se ve|muestra|aparece|color\w*|dibujo|ilustraci\w*|captura)\b", re.IGNORECASE)
 
 
 def parse_pages(question: str, total: int) -> list[int]:
@@ -143,127 +66,230 @@ def parse_pages(question: str, total: int) -> list[int]:
     return sorted(p for p in pages if p > 0)
 
 
-def _retrieve(document_id: str, question: str, qvec: np.ndarray) -> list[dict]:
-    """Todos los fragmentos del documento con su similitud vectorial y por palabras clave."""
-    with db.conn() as c:
-        rows = c.execute(
-            """SELECT id, idx, page, content,
-                      1 - (embedding <=> %(q)s) AS score,
-                      ts_rank_cd(to_tsvector('spanish', content),
-                                 websearch_to_tsquery('spanish', %(text)s)) AS kw
-               FROM chunks WHERE document_id = %(doc)s ORDER BY idx""",
-            {"q": qvec, "text": question, "doc": document_id},
+def parse_times(question: str) -> list[float]:
+    """Detecta momentos: "01:20", "1:05:10", "minuto 3", "al final"."""
+    text = question.lower()
+    out = [int(h or 0) * 3600 + int(m) * 60 + int(s)
+           for h, m, s in re.findall(r"\b(?:(\d{1,2}):)?(\d{1,2}):([0-5]\d)\b", text)]
+    out += [int(m) * 60 for m in re.findall(r"\bminuto\s+(\d{1,3})\b(?!:)", text)]
+    return sorted(set(float(t) for t in out))
+
+
+# ---------- Recuperación ----------
+
+_COLUMNS = ("c.id, c.source_id, c.idx, c.modality, c.page, c.t_start, c.t_end, c.content, c.asset_id, "
+            "s.name, s.kind")
+
+
+def search(question: str, qvec: np.ndarray, scope: list[str] | None, limit: int) -> list[dict]:
+    """Búsqueda híbrida en PostgreSQL: vecinos HNSW (coseno) + texto completo, fusionados con RRF.
+
+    La consulta por palabras usa OR entre términos: una pregunta en lenguaje natural casi nunca
+    contiene todas sus palabras en un mismo fragmento.
+    """
+    with db.conn() as c, c.transaction():
+        c.execute("SET LOCAL hnsw.ef_search = 100")
+        if scope and db.iterative_scan:
+            c.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+        return c.execute(
+            f"""
+            WITH q AS (
+                SELECT to_tsquery('spanish', replace(plainto_tsquery('spanish', %(text)s)::text, ' & ', ' | ')) AS ts
+            ),
+            vec AS (
+                SELECT id, dist, row_number() OVER (ORDER BY dist) AS r FROM (
+                    SELECT id, embedding <=> %(q)s AS dist FROM chunks
+                    WHERE embedding IS NOT NULL AND (%(scope)s::uuid[] IS NULL OR source_id = ANY(%(scope)s))
+                    ORDER BY embedding <=> %(q)s LIMIT %(n)s
+                ) v
+            ),
+            kw AS (
+                SELECT id, row_number() OVER (ORDER BY rank DESC) AS r FROM (
+                    SELECT id, ts_rank_cd(tsv, q.ts) AS rank FROM chunks, q
+                    WHERE tsv @@ q.ts AND (%(scope)s::uuid[] IS NULL OR source_id = ANY(%(scope)s))
+                    ORDER BY rank DESC LIMIT %(n)s
+                ) k
+            )
+            SELECT {_COLUMNS},
+                   1 - (c.embedding <=> %(q)s) AS score,
+                   coalesce(1.0 / (60 + vec.r), 0) + coalesce(1.0 / (60 + kw.r), 0) AS rrf
+            FROM (SELECT id FROM vec UNION SELECT id FROM kw) hit
+            JOIN chunks c ON c.id = hit.id JOIN sources s ON s.id = c.source_id
+            LEFT JOIN vec ON vec.id = hit.id LEFT JOIN kw ON kw.id = hit.id
+            ORDER BY rrf DESC LIMIT %(limit)s
+            """,
+            {"q": qvec, "text": question, "scope": scope, "n": CANDIDATES, "limit": limit},
         ).fetchall()
-    # Fusión de rankings (RRF): combina búsqueda semántica y por palabras clave.
-    by_vec = sorted(rows, key=lambda r: -r["score"])
-    by_kw = [r for r in sorted(rows, key=lambda r: -r["kw"]) if r["kw"] > 0]
-    rrf: dict[int, float] = {}
-    for rank, r in enumerate(by_vec):
-        rrf[r["id"]] = rrf.get(r["id"], 0) + 1 / (60 + rank)
-    for rank, r in enumerate(by_kw):
-        rrf[r["id"]] = rrf.get(r["id"], 0) + 1 / (60 + rank)
+
+
+def _source_chunks(source_id: str, qvec: np.ndarray) -> list[dict]:
+    with db.conn() as c:
+        return c.execute(
+            f"SELECT {_COLUMNS}, 1 - (c.embedding <=> %s) AS score, 0.0 AS rrf "
+            "FROM chunks c JOIN sources s ON s.id = c.source_id WHERE c.source_id = %s ORDER BY c.idx",
+            (qvec, source_id),
+        ).fetchall()
+
+
+def _overview(scope: list[str] | None, qvec: np.ndarray) -> list[dict]:
+    """Los primeros fragmentos de cada fuente: un panorama de toda la base."""
+    with db.conn() as c:
+        return c.execute(
+            f"""SELECT * FROM (
+                    SELECT {_COLUMNS}, 1 - (c.embedding <=> %(q)s) AS score, 0.0 AS rrf,
+                           row_number() OVER (PARTITION BY c.source_id ORDER BY c.idx) AS nth
+                    FROM chunks c JOIN sources s ON s.id = c.source_id
+                    WHERE s.status = 'ready' AND (%(scope)s::uuid[] IS NULL OR c.source_id = ANY(%(scope)s))
+                ) t WHERE nth <= 2 ORDER BY nth, name""",
+            {"q": qvec, "scope": scope},
+        ).fetchall()
+
+
+def _budget(rows: list[dict], limit: int) -> list[dict]:
+    chosen, used, seen = [], 0, set()
     for r in rows:
-        r["rrf"] = rrf[r["id"]]
-    return rows
+        if r["id"] in seen or used + len(r["content"]) > limit:
+            continue
+        seen.add(r["id"])
+        chosen.append(r)
+        used += len(r["content"])
+    return chosen
 
 
-def _select(rows: list[dict], pages: list[int], general: bool, total_pages: int):
-    """Decide qué texto ve el modelo. Devuelve (fragmentos para el contexto, nota para el modelo, estado)."""
-    ranked = sorted(rows, key=lambda r: -r["rrf"])
-    total_chars = sum(len(r["content"]) for r in rows)
+def select(question: str, qvec: np.ndarray, sources: list[dict]) -> tuple[list[dict], str, str]:
+    """Decide qué ve el modelo. Devuelve (fragmentos, nota para el modelo, estado para la UI)."""
+    scope = [str(s["id"]) for s in sources] or None
+    ranked = search(question, qvec, scope, limit=24)
+    general = bool(_GENERAL.search(question))
 
-    valid = [p for p in pages if p <= total_pages]
-    if pages:
-        notes = []
-        missing = [p for p in pages if p > total_pages]
-        if missing:
-            notes.append(f"El documento solo tiene {total_pages} páginas; no existe la página {', '.join(map(str, missing))}.")
-        chosen = [r for r in rows if r["page"] in valid]
-        empty = [p for p in valid if not any(r["page"] == p for r in rows)]
-        if empty:
-            notes.append(f"La página {', '.join(map(str, empty))} no tiene texto extraíble (puede ser una imagen).")
-        extra = [r for r in ranked if r["page"] not in valid][:2]
-        label = ", ".join(map(str, valid)) or "—"
-        notes.insert(0, f"El usuario pregunta por la página {label}. Abajo está el texto completo de esa página"
-                        " y un par de fragmentos relacionados de otras páginas.")
-        return chosen + extra, " ".join(notes), f"Leyendo la página {label}"
+    if len(sources) == 1:
+        src = sources[0]
+        rows = _source_chunks(str(src["id"]), qvec)
+        rank = {r["id"]: r["rrf"] for r in ranked}
+        for r in rows:
+            r["rrf"] = rank.get(r["id"], 0.0)
+        total_chars = sum(len(r["content"]) for r in rows)
 
-    if total_chars <= settings.full_doc_chars or general:
+        pages = parse_pages(question, src["meta"].get("pages", 0)) if src["kind"] == "pdf" else []
+        if pages:
+            hits = [r for r in rows if r["page"] in pages]
+            extra = [r for r in sorted(rows, key=lambda r: -r["rrf"]) if r["page"] not in pages][:2]
+            label = ", ".join(map(str, pages))
+            note = f"El usuario pregunta por la página {label} de «{src['name']}»; abajo está todo lo que contiene."
+            if not hits:
+                note += f" Esa página no existe o está vacía: el documento tiene {src['meta'].get('pages')} páginas."
+            return hits + extra, note, f"Leyendo la página {label}"
+
+        times = parse_times(question) if src["kind"] in ("audio", "video") else []
+        if times:
+            hits = [r for r in rows if any((r["t_start"] or 0) - 30 <= t <= (r["t_end"] or r["t_start"] or 0) + 30
+                                           for t in times)]
+            label = ", ".join(Piece("speech", "", t_start=t).locator() for t in times)
+            return hits, f"El usuario pregunta por el momento {label} de «{src['name']}».", f"Escuchando el {label}"
+
         if total_chars <= settings.full_doc_chars:
-            return rows, "Abajo está el texto completo del documento.", "Leyendo el documento completo"
-        # Documento grande y pregunta general: el inicio de cada página más lo más relevante.
-        chosen, used = [], 0
-        firsts = [next(r for r in rows if r["page"] == p) for p in sorted({r["page"] for r in rows})]
-        for r in firsts + ranked:
-            if r in chosen or used + len(r["content"]) > settings.full_doc_chars:
-                continue
-            chosen.append(r)
-            used += len(r["content"])
-        return chosen, "Abajo hay una selección representativa de todas las páginas del documento.", "Recorriendo el documento"
+            return rows, f"Abajo está el contenido completo de «{src['name']}».", "Leyendo la fuente completa"
+        if general:
+            firsts = list({r["page"] or r["idx"]: r for r in reversed(rows)}.values())[::-1]
+            chosen = _budget(firsts + sorted(rows, key=lambda r: -r["rrf"]), settings.full_doc_chars)
+            return sorted(chosen, key=lambda r: r["idx"]), "Abajo hay una muestra de toda la fuente.", "Recorriendo la fuente"
+        return [r for r in ranked if r["source_id"] == src["id"]][: settings.top_k], \
+            "Abajo están los fragmentos más relacionados con la pregunta.", "Leyendo los fragmentos más relevantes"
 
-    return ranked[: settings.top_k], "Abajo están los fragmentos del documento más relacionados con la pregunta.", "Leyendo los fragmentos más relevantes"
+    if general:
+        chosen = _budget(_overview(scope, qvec) + ranked, settings.full_doc_chars)
+        return chosen, "Abajo hay un panorama de las fuentes de la base y lo más relacionado con la pregunta.", \
+            "Recorriendo la base de conocimiento"
+    return ranked[: settings.top_k], "Abajo están los fragmentos más relacionados con la pregunta.", \
+        "Leyendo los fragmentos más relevantes"
 
 
-def answer(document_id: str, question: str) -> Iterator[dict]:
+# ---------- Respuesta ----------
+
+def _header(n: int, r: dict) -> str:
+    locator = Piece(r["modality"], "", r["page"], r["t_start"], r["t_end"]).locator()
+    return f"[{n}] {r['name']}" + (f" · {locator}" if locator else "") + f" · {MODALITY_LABEL[r['modality']]}"
+
+
+def serialize_source(n: int, r: dict) -> dict:
+    return {
+        "n": n, "chunk_id": r["id"], "source_id": str(r["source_id"]), "name": r["name"], "kind": r["kind"],
+        "modality": r["modality"], "page": r["page"], "t_start": r["t_start"], "t_end": r["t_end"],
+        "asset_id": r["asset_id"], "score": round(float(r["score"] or 0), 4), "content": r["content"],
+    }
+
+
+def _images(chosen: list[dict], question: str) -> dict[int, bytes]:
+    """Las imágenes mejor rankeadas por número de fragmento, para que un modelo multimodal las mire."""
+    if not settings.attach_images:
+        return {}
+    ranked = sorted(enumerate(chosen, start=1), key=lambda nr: -nr[1]["rrf"])
+    visual = [(n, r) for n, r in ranked if r["asset_id"]][: settings.attach_images]
+    # Solo si la pregunta habla de algo visual o una imagen está entre lo más relevante.
+    top = {r["id"] for _, r in ranked[:3]}
+    if not visual or not (_VISUAL.search(question) or any(r["id"] in top for _, r in visual)):
+        return {}
     with db.conn() as c:
-        doc = c.execute(
-            "SELECT id, name, pages, embed_provider, embed_model, embed_dim, projection "
-            "FROM documents WHERE id = %s",
-            (document_id,),
-        ).fetchone()
-        if not doc:
-            raise LookupError("Documento no encontrado")
+        rows = c.execute("SELECT id, data FROM assets WHERE id = ANY(%s)", ([r["asset_id"] for _, r in visual],)).fetchall()
+    data = {r["id"]: bytes(r["data"]) for r in rows}
+    return {n: data[r["asset_id"]] for n, r in visual if r["asset_id"] in data}
+
+
+def answer(question: str, scope: list[str]) -> Iterator[dict]:
+    with db.conn() as c:
+        sources = c.execute("SELECT id, name, kind, meta FROM sources WHERE id = ANY(%s::uuid[])",
+                            (scope,)).fetchall() if scope else []
+        if scope and not sources:
+            raise LookupError("Las fuentes elegidas ya no existen.")
+        ready = c.execute("SELECT count(*) AS n FROM chunks WHERE embedding IS NOT NULL").fetchone()["n"]
         history = c.execute(
-            "SELECT role, content FROM (SELECT id, role, content FROM messages "
-            "WHERE document_id = %s ORDER BY id DESC LIMIT 4) h ORDER BY id",
-            (document_id,),
+            "SELECT role, content FROM (SELECT id, role, content FROM messages ORDER BY id DESC LIMIT 4) h ORDER BY id"
         ).fetchall()
+    if not ready:
+        raise LookupError("La base de conocimiento está vacía: copia archivos en la carpeta o súbelos.")
 
-    yield {"type": "status", "text": "Buscando en el documento"}
+    yield {"type": "status", "text": "Buscando en la base"}
     cfg = providers.load()
-    # La pregunta se vectoriza con el mismo modelo con que se indexó el documento.
-    qvec = providers.embed([question], doc["embed_provider"], doc["embed_model"], cfg)[0]
-    if len(qvec) != doc["embed_dim"]:
-        raise providers.ProviderError("El modelo de embeddings cambió de dimensión; vuelve a subir el PDF.")
+    qvec = np.asarray(providers.embed_query(question, cfg), dtype=np.float32)
+    chosen, note, status = select(question, qvec, sources)
 
-    rows = _retrieve(document_id, question, np.asarray(qvec, dtype=np.float32))
-    pages = parse_pages(question, doc["pages"])
-    chosen, note, status = _select(rows, pages, bool(_GENERAL.search(question)), doc["pages"])
-
-    # Lo que se dibuja en el mapa: los fragmentos usados, los más relevantes primero.
-    on_pages = [r for r in chosen if r["page"] in pages]
-    shown = on_pages + sorted((r for r in chosen if r not in on_pages), key=lambda r: -r["rrf"])
-    shown = shown[: max(settings.top_k, len(on_pages))]
-    sources = [
-        {"chunk_id": r["id"], "idx": r["idx"], "page": r["page"],
-         "score": round(float(r["score"]), 4), "content": r["content"]}
-        for r in shown
-    ]
-    qx, qy = _project(qvec, doc["projection"])
-    yield {"type": "sources", "query": {"x": qx, "y": qy}, "sources": sources}
+    items = [serialize_source(n, r) for n, r in enumerate(chosen, start=1)]
+    query = project(qvec, library.projection) if library.projection else None
+    yield {"type": "sources", "query": query, "sources": items}
     yield {"type": "status", "text": status}
 
-    by_page: dict[int, list[str]] = {}
-    for r in sorted(chosen, key=lambda r: r["idx"]):
-        by_page.setdefault(r["page"], []).append(r["content"])
-    context = "\n\n".join(f"[Página {p}]\n" + "\n".join(parts) for p, parts in sorted(by_page.items()))
-
+    context = "\n\n".join(f"{_header(n, r)}\n{r['content']}" for n, r in enumerate(chosen, start=1))
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in history:
-        text = m["content"] if m["role"] == "user" else m["content"][:800]
+        # Los números de cita de respuestas anteriores no corresponden a los fragmentos de ahora.
+        text = m["content"] if m["role"] == "user" else re.sub(r"\[\d+\]", "", m["content"])[:800]
         messages.append({"role": m["role"], "content": text})
+    images = _images(chosen, question)
     messages.append({
         "role": "user",
         "content": (
-            f"Documento: «{doc['name']}» ({doc['pages']} páginas).\n{note}\n\n"
-            f"--- TEXTO DEL DOCUMENTO ---\n{context or '(sin texto)'}\n--- FIN DEL TEXTO ---\n\n"
-            f"Pregunta: {question}"
+            f"{note}\n\n--- FRAGMENTOS ---\n{context or '(ninguno)'}\n--- FIN DE LOS FRAGMENTOS ---\n\n"
+            + (f"Se adjuntan las imágenes de los fragmentos {', '.join(f'[{n}]' for n in images)}, en ese orden.\n"
+               if images else "")
+            + f"Pregunta: {question}"
         ),
+        "images": list(images.values()),
     })
 
+    provider = cfg["chat_provider"]
     parts: list[str] = []
     thinking = False
-    for kind, piece in providers.chat_stream(messages, cfg):
+    try:
+        stream = providers.chat_stream(messages, provider, cfg)
+        first = next(stream, None)
+    except providers.ProviderError:
+        if not images:
+            raise
+        # El modelo de chat no acepta imágenes: se responde solo con las descripciones.
+        messages[-1]["images"] = []
+        stream = providers.chat_stream(messages, provider, cfg)
+        first = next(stream, None)
+    for kind, piece in chain([first] if first else [], stream):
         if kind == "thinking":
             if not thinking:
                 thinking = True
@@ -276,16 +302,10 @@ def answer(document_id: str, question: str) -> Iterator[dict]:
 
     reply = "".join(parts).strip()
     if not reply:
-        raise providers.ProviderError(
-            "El modelo terminó sin escribir una respuesta. Prueba de nuevo o cambia de modelo en el botón motor."
-        )
-    slim = [{k: s[k] for k in ("chunk_id", "idx", "page", "score", "content")} for s in sources]
+        raise providers.ProviderError("El modelo terminó sin escribir una respuesta. Prueba de nuevo o cambia de modelo.")
+    slim = {"query": query, "items": items, "scope": scope, "model": providers.model_label(provider, cfg)}
     with db.conn() as c:
-        c.execute("INSERT INTO messages(document_id, role, content) VALUES (%s, 'user', %s)",
-                  (document_id, question))
-        row = c.execute(
-            "INSERT INTO messages(document_id, role, content, sources) VALUES (%s, 'assistant', %s, %s) "
-            "RETURNING id",
-            (document_id, reply, Jsonb({"query": {"x": qx, "y": qy}, "items": slim})),
-        ).fetchone()
+        c.execute("INSERT INTO messages(role, content) VALUES ('user', %s)", (question,))
+        row = c.execute("INSERT INTO messages(role, content, sources) VALUES ('assistant', %s, %s) RETURNING id",
+                        (reply, Jsonb(slim))).fetchone()
     yield {"type": "done", "message_id": row["id"]}

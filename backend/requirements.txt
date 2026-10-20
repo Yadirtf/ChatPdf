@@ -3,7 +3,12 @@ uvicorn[standard]>=0.32
 python-multipart>=0.0.18
 psycopg[binary,pool]>=3.2.3
 pgvector>=0.3.6
-pypdf>=5.1
 httpx>=0.27
 numpy>=2.1
 pydantic-settings>=2.6
+# Base de conocimiento multimodal
+pymupdf>=1.25          # texto, imágenes y gráficos de los PDF
+pillow>=11
+av>=13                 # audio y video (trae FFmpeg incluido)
+faster-whisper>=1.1    # transcripción local
+watchfiles>=1.0        # vigila la carpeta de conocimiento
