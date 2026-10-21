@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import av
+import numpy as np
 
 from .config import settings
 from .imaging import Picture, difference, prepare, signature
@@ -72,9 +73,35 @@ def whisper_loaded() -> bool:
     return _whisper is not None
 
 
+SAMPLE_RATE = 16000  # lo que espera Whisper
+
+
+def decode_audio(path: Path) -> np.ndarray:
+    """Pista de audio como float32 mono a 16 kHz.
+
+    Se decodifica aquí con PyAV en lugar de dejárselo a faster-whisper: su decodificador usa
+    argumentos de av.open() que PyAV 14+ ya no acepta (metadata_errors).
+    """
+    resampler = av.AudioResampler(format="flt", layout="mono", rate=SAMPLE_RATE)
+    chunks: list[np.ndarray] = []
+    try:
+        with av.open(str(path)) as c:
+            stream = c.streams.audio[0]
+            for frame in c.decode(stream):
+                frame.pts = None  # evita avisos de marcas de tiempo al remuestrear
+                chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(frame)]
+            chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(None)]
+    except av.FFmpegError as e:
+        raise MediaError(f"No se pudo decodificar el audio: {e}") from e
+    return np.concatenate(chunks).astype(np.float32) if chunks else np.zeros(0, np.float32)
+
+
 def transcribe(path: Path, duration: float, on_progress: Callable[[float], None]) -> tuple[list[Segment], str]:
+    audio = decode_audio(path)
+    if not audio.size:
+        return [], ""
     segments, info = _model().transcribe(
-        str(path),
+        audio,
         language=settings.whisper_language or None,
         vad_filter=True,                    # salta silencios: más rápido y sin alucinaciones
         condition_on_previous_text=False,   # evita que un error se repita en bucle
